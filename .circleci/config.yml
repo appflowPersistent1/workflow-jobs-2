@@ -1,13 +1,58 @@
-version: 2.1 # Use version 2.1 to enable Orb usage.
-
-orbs:
-  win: circleci/windows@2.2.0 # The Windows orb give you everything you need to start using the Windows executor.
-
+version: 2.1
 jobs:
-  build: # name of your job
-    executor: win/default # executor type
-
+  build:
+    docker:
+      - image: circleci/ruby:2.6.3-node
+      - image: redis:3.2.9
+      - image: circleci/postgres:10.3
+    environment:
+      RACK_ENV: test
+      RAILS_ENV: test
+      CIRCLE_TEST_REPORTS: test-reports
+    parallelism: 8
     steps:
-      # Commands are run in a Windows virtual machine environment
       - checkout
-      - run: Write-Host 'Hello, Windows'
+      - run:
+          name: Switch timezone to Mountain
+          command: sudo rm /etc/localtime && sudo ln -s /usr/share/zoneinfo/America/Boise /etc/localtime && date
+      - run: sudo apt-get update
+      - run: sudo apt install postgresql-client
+      - run: mkdir -p tmp/cache $CIRCLE_TEST_REPORTS
+      - run: npm install
+      - run: gem install bundler
+      - restore_cache:
+          keys:
+            - v1-dep-bundle-{{ checksum "Gemfile.lock" }}
+            - v1-dep-bundle-
+      - run: bundle check --path=vendor/bundle || bundle install --path=vendor/bundle --jobs=4 --retry=3
+      - save_cache:
+          key: v1-dep-bundle-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+      - run:
+          name: Database
+          command: |
+            mkdir -p config
+            echo 'test:
+              database: circle_ruby_test
+              adapter: postgresql
+              encoding: unicode
+              pool: 25
+              prepared_statements: false
+              username: root
+              host: localhost
+            ' > config/database.yml
+            bundle exec rake db:create db:structure:load --trace
+      - run:
+          name: Tests
+          command: |
+            TESTFILES=$(circleci tests glob "spec/requests/**/*.rb" "spec/controllers/**/*.rb" "spec/integration/**/*.rb" "spec/concerns/**/*.rb" "spec/services/**/*.rb" "spec/helpers/**/*.rb" "spec/lib/**/*.rb" "spec/mailers/**/*.rb" "spec/models/**/*.rb" "spec/workers/**/*.rb"| circleci tests split --split-by=timings)
+            echo ${TESTFILES}
+            bundle exec rspec -r rspec_junit_formatter --format RspecJunitFormatter -o $CIRCLE_TEST_REPORTS/rspec/junit.xml -- ${TESTFILES}
+          no_output_timeout: 15m
+      - run: if [ $CIRCLE_NODE_INDEX == 0 ] ; then bundle exec bundle-audit check --update --ignore CVE-<PRIVATE> ; fi
+      - run: if [ $CIRCLE_NODE_INDEX == 1 ] ; then bash ./script/syntax_check.sh ; fi
+      - run: if [ $CIRCLE_NODE_INDEX == 2 ] ; then bundle exec brakeman --exit-on-warn ; fi
+      - add_ssh_keys
+      - store_test_results:
+          path: test-reports
